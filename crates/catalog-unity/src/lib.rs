@@ -873,7 +873,7 @@ impl ObjectStoreFactory for UnityCatalogFactory {
         config: &StorageConfig,
     ) -> DeltaResult<(ObjectStoreRef, Path)> {
         let (table_path, temp_creds) = UnityCatalogBuilder::execute_uc_future(
-            UnityCatalogBuilder::get_uc_location_and_token(table_uri.as_str(), Some(&config.raw)),
+            UnityCatalogBuilder::get_uc_location_and_token(table_uri.as_str(), None),
         )??;
 
         let mut storage_options = config.raw.clone();

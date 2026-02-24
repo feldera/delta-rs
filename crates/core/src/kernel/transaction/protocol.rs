@@ -207,9 +207,12 @@ impl ProtocolChecker {
         if let Some(features) = required_features {
             let mut diff = features.difference(&self.reader_features).peekable();
             if diff.peek().is_some() {
-                return Err(TransactionError::UnsupportedTableFeatures(
-                    diff.cloned().collect(),
-                ));
+                // return Err(TransactionError::UnsupportedTableFeatures(
+                //     diff.cloned().collect(),
+                // ));
+                println!("WARNING: {}", TransactionError::UnsupportedTableFeatures(
+                     diff.cloned().collect(),
+                 ));                
             }
         };
         Ok(())

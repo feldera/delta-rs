@@ -531,7 +531,54 @@ impl<'a> DeltaScanBuilder<'a> {
 
         let file_scan_config =
             FileScanConfigBuilder::new(self.log_store.object_store_url(), Arc::new(file_source))
-                .with_file_groups(
+                .with_file_groups({
+                    // For unpartitioned tables, pre-split the single FileGroup
+                    // into `target_partitions` round-robin chunks so DataFusion
+                    // gets the requested scan parallelism natively, without
+                    // needing to insert a `RepartitionExec(RoundRobinBatch)`
+                    // above the scan. Files keep their natural log-replay
+                    // order within each chunk; round-robin distribution puts
+                    // an interleaved slice of the file list into each chunk,
+                    // so the head files of all partitions cover the breadth
+                    // of the table -- "mostly in order" ingestion at the
+                    // consumer when files are roughly write-ordered.
+                    //
+                    // Splitting must produce *exactly* `target_partitions`
+                    // groups (capped at `files.len()`); otherwise DataFusion
+                    // sees `input_partitions != target_partitions` and adds
+                    // its own RoundRobinBatch on top, which we'd rather not.
+                    //
+                    // Enabled by default; disable with
+                    // `DELTA_SCAN_ROUND_ROBIN=false` (or `=0`) to fall back
+                    // to the upstream behavior of one FileGroup per
+                    // partition-value bucket. Useful if the new behavior
+                    // ever surprises a consumer that depends on the old
+                    // single-FileGroup shape.
+                    let round_robin_enabled = !matches!(
+                        std::env::var("DELTA_SCAN_ROUND_ROBIN")
+                            .ok()
+                            .as_deref()
+                            .map(str::to_ascii_lowercase)
+                            .as_deref(),
+                        Some("false" | "0"),
+                    );
+                    let target_partitions =
+                        self.session.config().options().execution.target_partitions;
+                    let file_groups: Vec<Vec<PartitionedFile>> = if round_robin_enabled
+                        && file_groups.len() == 1
+                        && target_partitions > 1
+                    {
+                        let (_, files) = file_groups.into_iter().next().unwrap();
+                        let group_count = target_partitions.min(files.len()).max(1);
+                        let mut groups: Vec<Vec<PartitionedFile>> =
+                            (0..group_count).map(|_| Vec::new()).collect();
+                        for (i, file) in files.into_iter().enumerate() {
+                            groups[i % group_count].push(file);
+                        }
+                        groups
+                    } else {
+                        file_groups.into_values().collect()
+                    };
                     // If all files were filtered out, we still need to emit at least one partition to
                     // pass datafusion sanity checks.
                     //
@@ -539,9 +586,9 @@ impl<'a> DeltaScanBuilder<'a> {
                     if file_groups.is_empty() {
                         vec![FileGroup::from(vec![])]
                     } else {
-                        file_groups.into_values().map(FileGroup::from).collect()
-                    },
-                )
+                        file_groups.into_iter().map(FileGroup::from).collect()
+                    }
+                })
                 .with_projection_indices(self.projection.cloned())?
                 .with_limit(self.limit)
                 .build();

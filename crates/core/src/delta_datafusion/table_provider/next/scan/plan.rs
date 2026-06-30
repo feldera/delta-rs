@@ -865,6 +865,87 @@ mod tests {
         Ok(())
     }
 
+    /// Reproduces the UC-Uniform-over-Iceberg snapshot read failure, including the
+    /// nested-struct case.
+    ///
+    /// The fixture is a `columnMapping.mode=id` table whose Parquet columns carry
+    /// their *logical* names plus `PARQUET:field_id`, while the Delta metadata maps
+    /// every field -- top level and the six children of the `after` struct -- to a
+    /// diverging physical name `col-N`. `op` is non-nullable.
+    ///
+    /// A reader that resolves column-mapped reads by physical name fails two ways:
+    /// the top-level non-nullable `op` finds no `col-102` on disk, and the `after`
+    /// struct's cast target names its children `col-104..col-109`, which share no
+    /// overlap with the file's logical child names -- the customer's "Cannot cast
+    /// struct with 6 fields to 6 fields because there is no field name overlap". A
+    /// field-id-aware reader relabels both levels and reads the rows.
+    #[tokio::test]
+    async fn test_uniform_iceberg_id_snapshot_reads_by_field_id() -> TestResult {
+        use arrow::array::{Array, ArrayRef, StringArray, StructArray};
+        use arrow::compute::cast;
+        use arrow::datatypes::DataType;
+
+        // Read string values regardless of Utf8/Utf8View physical encoding (the
+        // provider forces view types by default).
+        fn strings(array: &ArrayRef) -> Vec<Option<String>> {
+            let utf8 = cast(array, &DataType::Utf8).expect("cast to Utf8");
+            let col = utf8.as_any().downcast_ref::<StringArray>().unwrap();
+            (0..col.len())
+                .map(|i| (!col.is_null(i)).then(|| col.value(i).to_string()))
+                .collect()
+        }
+
+        let mut table = open_fs_path("../test/tests/data/uniform_iceberg_id");
+        table.load().await?;
+
+        let provider = table.table_provider().await?;
+        let ctx = create_session().into_inner();
+
+        let batches = ctx
+            .read_table(provider.clone())?
+            .select_columns(&["op", "after"])?
+            .collect()
+            .await?;
+
+        // Top-level non-nullable `op` (`col-102`) resolves by field id.
+        let op: Vec<Option<String>> = batches
+            .iter()
+            .flat_map(|b| strings(b.column(0)))
+            .collect();
+        assert_eq!(
+            op,
+            vec![
+                Some("c".to_string()),
+                Some("c".to_string()),
+                Some("u".to_string())
+            ]
+        );
+
+        // Nested `after` struct: its children resolve by field id, so a child read
+        // by its logical name (`transaction__merchant_name`, `col-106`) returns the
+        // real values instead of failing the struct cast.
+        let merchant: Vec<Option<String>> = batches
+            .iter()
+            .flat_map(|b| {
+                let after = b.column(1).as_any().downcast_ref::<StructArray>().unwrap();
+                let name = after
+                    .column_by_name("transaction__merchant_name")
+                    .expect("nested child resolved to its logical name");
+                strings(name)
+            })
+            .collect();
+        assert_eq!(
+            merchant,
+            vec![
+                Some("Coffee Shop".to_string()),
+                Some("Gas Station".to_string()),
+                Some("Restaurant".to_string()),
+            ]
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_column_mapping_direct_provider_scan_for_data_column_filter() -> TestResult {
         let mut table = open_fs_path("../test/tests/data/table_with_column_mapping");

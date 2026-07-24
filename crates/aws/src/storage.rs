@@ -8,11 +8,11 @@ use std::time::Duration;
 
 use aws_config::{Region, SdkConfig};
 use bytes::Bytes;
-use deltalake_core::logstore::object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+use deltalake_core::logstore::object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential};
 use deltalake_core::logstore::object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    ObjectStoreScheme, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
-    Result as ObjectStoreResult,
+    CopyOptions, CredentialProvider, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, ObjectStoreScheme, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    RenameOptions, Result as ObjectStoreResult,
 };
 use deltalake_core::logstore::{
     ObjectStoreFactory, ObjectStoreRef, StorageConfig, client_options_from_certificate,
@@ -47,6 +47,23 @@ impl ObjectStoreFactory for S3ObjectStoreFactory {
         url: &Url,
         config: &StorageConfig,
     ) -> DeltaResult<(ObjectStoreRef, Path)> {
+        self.build_object_store(url, config, None)
+    }
+}
+
+impl S3ObjectStoreFactory {
+    /// Build an S3 object store from `config`.
+    ///
+    /// When `credentials` is `Some`, the store uses that provider instead of
+    /// resolving credentials from the AWS SDK. Unity Catalog uses this to install
+    /// a provider that re-vends its temporary S3 tokens before they expire;
+    /// without it the store keeps the initial token until it lapses (~hourly).
+    pub fn build_object_store(
+        &self,
+        url: &Url,
+        config: &StorageConfig,
+        credentials: Option<Arc<dyn CredentialProvider<Credential = AwsCredential>>>,
+    ) -> DeltaResult<(ObjectStoreRef, Path)> {
         let options = self.with_env_s3(&config.raw);
 
         // All S3-likes should start their builder the same way
@@ -72,7 +89,9 @@ impl ObjectStoreFactory for S3ObjectStoreFactory {
         }
 
         let s3_options = S3StorageOptions::from_map(&options)?;
-        if let Some(ref sdk_config) = s3_options.sdk_config {
+        if let Some(credentials) = credentials {
+            builder = builder.with_credentials(credentials);
+        } else if let Some(ref sdk_config) = s3_options.sdk_config {
             builder =
                 builder.with_credentials(Arc::new(AWSForObjectStore::new(sdk_config.clone())));
         }

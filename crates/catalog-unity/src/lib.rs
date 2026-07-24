@@ -38,6 +38,8 @@ use crate::client::retry::*;
 use deltalake_core::logstore::{
     ObjectStoreFactory, ObjectStoreRef, config::str_is_truthy, object_store_factories,
 };
+#[cfg(feature = "aws")]
+pub mod aws_credentials;
 pub mod client;
 pub mod credential;
 
@@ -514,6 +516,19 @@ impl UnityCatalogBuilder {
     /// Returns the storage location and temporary token for the Unity Catalog table.
     ///
     /// If storage options are provided, they override environment variables for authentication.
+    /// Build a [`UnityCatalog`] client from the environment, overridden by
+    /// `storage_options` when provided.
+    fn build_catalog(
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<UnityCatalog, UnityCatalogError> {
+        let builder = match storage_options {
+            Some(options) => UnityCatalogBuilder::from_env()
+                .try_with_options(options.iter().map(|(k, v)| (k.as_str(), v.as_str())))?,
+            None => UnityCatalogBuilder::from_env(),
+        };
+        Ok(builder.build()?)
+    }
+
     pub async fn get_uc_location_and_token(
         table_uri: &str,
         storage_options: Option<&HashMap<String, String>>,
@@ -529,14 +544,7 @@ impl UnityCatalogBuilder {
         let database_name = uri_parts[1];
         let table_name = uri_parts[2];
 
-        let unity_catalog = if let Some(options) = storage_options {
-            let mut builder = UnityCatalogBuilder::from_env();
-            builder =
-                builder.try_with_options(options.iter().map(|(k, v)| (k.as_str(), v.as_str())))?;
-            builder.build()?
-        } else {
-            UnityCatalogBuilder::from_env().build()?
-        };
+        let unity_catalog = Self::build_catalog(storage_options)?;
 
         let storage_location = unity_catalog
             .get_table_storage_location(Some(catalog_id.to_string()), database_name, table_name)
@@ -871,6 +879,60 @@ impl UnityCatalog {
     }
 }
 
+/// Build an S3 object store for a Unity Catalog table, with a credential
+/// provider that re-vends the temporary token before it expires.
+///
+/// Returns `Ok(None)` when the table's storage is not S3, so the caller falls
+/// back to the static-credential path used for other clouds.
+#[cfg(feature = "aws")]
+fn build_s3_store_with_refresh(
+    table_uri: &Url,
+    config: &StorageConfig,
+) -> DeltaResult<Option<(ObjectStoreRef, Path)>> {
+    use crate::aws_credentials::UnityS3CredentialProvider;
+
+    // uc://<catalog>.<database>.<table>
+    let parts: Vec<&str> = table_uri.as_str()[5..].split('.').collect();
+    if parts.len() != 3 {
+        return Ok(None);
+    }
+    let (catalog_id, database_name, table_name) = (
+        parts[0].to_string(),
+        parts[1].to_string(),
+        parts[2].to_string(),
+    );
+
+    let catalog = Arc::new(UnityCatalogBuilder::build_catalog(Some(&config.raw))?);
+
+    let storage_location = UnityCatalogBuilder::execute_uc_future(
+        catalog.get_table_storage_location(Some(catalog_id.clone()), &database_name, &table_name),
+    )??;
+
+    let table_url = ensure_table_uri(&storage_location)?;
+    if !matches!(table_url.scheme(), "s3" | "s3a") {
+        return Ok(None);
+    }
+
+    let provider = Arc::new(UnityS3CredentialProvider::new(
+        Arc::clone(&catalog),
+        catalog_id,
+        database_name,
+        table_name,
+    ));
+
+    let (store, prefix) = deltalake_aws::storage::S3ObjectStoreFactory::default()
+        .build_object_store(&table_url, config, Some(provider))?;
+
+    // The S3 factory returns a bucket-rooted store plus the table's key prefix.
+    // The uc:// logstore ignores that prefix and derives paths from the
+    // (path-less) uc:// location, so it would read at the bucket root. Mirror
+    // the static uc:// path and hand back a store already rooted at the table.
+    use deltalake_core::logstore::object_store::prefix::PrefixStore;
+    let store: ObjectStoreRef = Arc::new(PrefixStore::new(store, prefix));
+
+    Ok(Some((store, Path::default())))
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct UnityCatalogFactory {}
 
@@ -880,6 +942,14 @@ impl ObjectStoreFactory for UnityCatalogFactory {
         table_uri: &Url,
         config: &StorageConfig,
     ) -> DeltaResult<(ObjectStoreRef, Path)> {
+        // S3 tables install a credential provider that re-vends Unity Catalog's
+        // temporary tokens before they expire. Other clouds fall through to the
+        // static-credential path below (refresh there is a follow-up).
+        #[cfg(feature = "aws")]
+        if let Some(store) = build_s3_store_with_refresh(table_uri, config)? {
+            return Ok(store);
+        }
+
         let (table_path, temp_creds) = UnityCatalogBuilder::execute_uc_future(
             UnityCatalogBuilder::get_uc_location_and_token(table_uri.as_str(), Some(&config.raw)),
         )??;

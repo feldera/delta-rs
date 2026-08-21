@@ -91,6 +91,9 @@ validator = { version = "0.19", features = ["derive"] }
 
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"]}
+# Hand-build deletion-vector fixtures: delta-rs reads DVs but cannot write them.
+crc = "3"
+roaring = "0.11"
 criterion = "0.5"
 ctor = "0"
 deltalake-test = { path = "../test" }
@@ -105,6 +108,7 @@ tempfile = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-test = "0.4.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+z85 = "3"
 
 [features]
 default = ["rustls"]

@@ -247,7 +247,31 @@ pub(crate) fn into_keep_masks(loaded: Vec<LoadedDv>) -> DashMap<String, Vec<bool
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::path::Path as FsPath;
+
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use crc::{CRC_32_ISO_HDLC, Crc};
+    use datafusion::catalog::TableProvider;
+    use datafusion::prelude::SessionContext;
+    use parquet::arrow::ArrowWriter;
+    use roaring::RoaringTreemap;
+    use serde_json::json;
+
     use super::*;
+    use crate::kernel::{Action, Add, PrimitiveType, StructField};
+    use crate::operations::create::CreateBuilder;
+    use crate::table::builder::ensure_table_uri;
+    use crate::table::config::TableProperty;
+    use crate::{DeltaTable, DeltaTableBuilder};
+
+    /// Little-endian magic prefixing a portable Roaring bitmap in a DV file.
+    const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1_681_511_377;
+
+    /// Rows per data file in the fixture; its vector hides the row at index 1.
+    const ROWS_PER_FILE: i64 = 4;
 
     fn descriptor(storage_type: StorageType, path_or_inline_dv: &str) -> DeletionVectorDescriptor {
         DeletionVectorDescriptor {
@@ -330,5 +354,192 @@ mod tests {
         assert!(storage.head(&url).is_err());
         assert!(storage.put(&url, Bytes::new(), true).is_err());
         assert!(storage.copy_atomic(&url, &url).is_err());
+    }
+
+    /// Serialize one deletion vector in the on-disk layout the Delta protocol
+    /// specifies, returning the bytes and the `sizeInBytes` for its descriptor.
+    ///
+    /// ```text
+    /// 1 byte    version (1)
+    /// 4 bytes   dv_size, big endian      <- the descriptor's offset points here
+    /// 4 bytes   magic, little endian
+    /// n bytes   portable Roaring bitmap
+    /// 4 bytes   CRC-32/ISO-HDLC over magic..=bitmap, big endian
+    /// ```
+    fn deletion_vector_file(deleted_rows: &[u64]) -> (Vec<u8>, i32) {
+        let mut bitmap = RoaringTreemap::new();
+        for row in deleted_rows {
+            bitmap.insert(*row);
+        }
+        let mut bitmap_bytes = Vec::new();
+        bitmap.serialize_into(&mut bitmap_bytes).unwrap();
+
+        // `dv_size` covers the magic and the bitmap, but not the CRC.
+        let dv_size = (4 + bitmap_bytes.len()) as u32;
+
+        let mut checksummed = Vec::with_capacity(dv_size as usize);
+        checksummed.extend_from_slice(&ROARING_BITMAP_PORTABLE_MAGIC.to_le_bytes());
+        checksummed.extend_from_slice(&bitmap_bytes);
+        let crc = Crc::<u32>::new(&CRC_32_ISO_HDLC).checksum(&checksummed);
+
+        let mut bytes = Vec::with_capacity(9 + checksummed.len());
+        bytes.push(1u8); // version
+        bytes.extend_from_slice(&dv_size.to_be_bytes());
+        bytes.extend_from_slice(&checksummed);
+        bytes.extend_from_slice(&crc.to_be_bytes());
+
+        (bytes, dv_size as i32)
+    }
+
+    /// Write one Parquet data file and return its size.
+    fn write_data_file(path: &FsPath, first_id: i64) -> u64 {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        let ids: Vec<i64> = (first_id..first_id + ROWS_PER_FILE).collect();
+        let vals: Vec<String> = ids.iter().map(|id| format!("v{id}")).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(vals)),
+            ],
+        )
+        .unwrap();
+
+        let mut writer = ArrowWriter::try_new(File::create(path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    /// Create a table under `root` with `files` data files, every one carrying a
+    /// persisted (`"u"`) deletion vector.
+    ///
+    /// Written by hand because delta-rs reads deletion vectors but cannot write
+    /// them, so this is the only way to get a table shaped like the ones engines
+    /// with deletion vectors enabled produce.
+    async fn table_with_deletion_vectors(root: &FsPath, files: usize) {
+        let mut adds = Vec::with_capacity(files);
+
+        for index in 0..files {
+            let file_name = format!("part-{index:05}.parquet");
+            let size = write_data_file(&root.join(&file_name), index as i64 * ROWS_PER_FILE);
+
+            let uuid = uuid::Uuid::new_v4();
+            let (dv_bytes, size_in_bytes) = deletion_vector_file(&[1]);
+            std::fs::write(root.join(format!("deletion_vector_{uuid}.bin")), dv_bytes).unwrap();
+
+            adds.push(Add {
+                path: file_name,
+                size: size as i64,
+                modification_time: 1_700_000_000_000,
+                data_change: true,
+                stats: Some(json!({ "numRecords": ROWS_PER_FILE }).to_string()),
+                deletion_vector: Some(DeletionVectorDescriptor {
+                    storage_type: StorageType::UuidRelativePath,
+                    path_or_inline_dv: z85::encode(uuid.as_bytes()),
+                    offset: Some(1),
+                    size_in_bytes,
+                    cardinality: 1,
+                }),
+                ..Default::default()
+            });
+        }
+
+        CreateBuilder::new()
+            .with_location(root.to_str().unwrap())
+            .with_columns([
+                StructField::new(
+                    "id".to_string(),
+                    crate::kernel::DataType::Primitive(PrimitiveType::Long),
+                    false,
+                ),
+                StructField::new(
+                    "val".to_string(),
+                    crate::kernel::DataType::Primitive(PrimitiveType::String),
+                    true,
+                ),
+            ])
+            .with_configuration_property(TableProperty::EnableDeletionVectors, Some("true"))
+            .with_actions(adds.into_iter().map(Action::Add))
+            .await
+            .unwrap();
+    }
+
+    /// Plan a scan of the table at `uri` and return the row count it would read.
+    async fn plan_and_run(uri: &str) -> usize {
+        let table: DeltaTable = DeltaTableBuilder::from_url(ensure_table_uri(uri).unwrap())
+            .unwrap()
+            .load()
+            .await
+            .unwrap();
+
+        let ctx = SessionContext::new();
+        let log_store = table.log_store();
+        ctx.runtime_env()
+            .register_object_store(log_store.root_url(), log_store.root_object_store(None));
+        let provider: Arc<dyn TableProvider> = table.table_provider().await.unwrap();
+        ctx.register_table("snapshot", provider).unwrap();
+
+        ctx.sql("select \"id\" from snapshot")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum()
+    }
+
+    /// Scan planning must not need a blocking thread per deletion vector.
+    ///
+    /// Loading a vector used to run in its own `spawn_blocking` task, unbounded,
+    /// and each task then waited on the kernel's sync-over-async bridge, which
+    /// returns its result through a *nested* `spawn_blocking`. One vector
+    /// therefore held a thread while needing a second, so once concurrent loads
+    /// reached `max_blocking_threads` the pool deadlocked with no error and no
+    /// timeout. Eight vectors against four blocking threads reproduced that; in
+    /// production a table with more than 512 of them reached Tokio's default.
+    ///
+    /// The scan runs on its own thread so a regression fails the test instead of
+    /// hanging the suite, and the wedged runtime is abandoned rather than
+    /// dropped, since dropping it joins threads that never return.
+    #[test]
+    fn scan_planning_does_not_need_a_thread_per_deletion_vector() {
+        const FILES: usize = 8;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(table_with_deletion_vectors(&root, FILES));
+
+        let uri = root.to_str().unwrap().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Two spare slots beyond the workers is enough for snapshot loading,
+            // which blocks a thread and then waits on the same pool as well; it
+            // is not enough for one thread per deletion vector.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .max_blocking_threads(4)
+                .enable_all()
+                .build()
+                .unwrap();
+            let rows = runtime.block_on(plan_and_run(&uri));
+            let _ = tx.send(rows);
+            runtime.shutdown_background();
+        });
+
+        let rows = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("scanning a table with deletion vectors exhausted the blocking pool");
+
+        // Every file keeps three of its four rows.
+        assert_eq!(rows, FILES * (ROWS_PER_FILE as usize - 1));
     }
 }

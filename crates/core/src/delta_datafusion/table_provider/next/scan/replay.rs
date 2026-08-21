@@ -21,26 +21,24 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use delta_kernel::{
-    Engine, ExpressionRef,
+    ExpressionRef,
     engine::{arrow_conversion::TryIntoArrow, arrow_data::ArrowEngineData},
     engine_data::FilteredEngineData,
     expressions::{Scalar, StructData},
-    scan::{
-        Scan as KernelScan, ScanMetadata,
-        state::{DvInfo, ScanFile},
-    },
+    scan::{Scan as KernelScan, ScanMetadata, state::ScanFile},
 };
 use futures::Stream;
 use itertools::Itertools;
 use pin_project_lite::pin_project;
+use tokio::sync::mpsc::UnboundedSender;
 use url::Url;
 
+use super::dv::PendingDv;
 use crate::{
     DeltaResult, DeltaTableError,
     delta_datafusion::{DeltaScanConfig, engine::to_datafusion_scalar},
     kernel::{
-        LogicalFileView, ReceiverStreamBuilder, Scan, StatsProjection, StructDataExt,
-        parse_stats_column_with_schema,
+        LogicalFileView, Scan, StatsProjection, StructDataExt, parse_stats_column_with_schema,
     },
 };
 
@@ -68,8 +66,6 @@ pin_project! {
     pub(crate) struct ScanFileStream<'a, S> {
         pub(crate) metrics: ReplayStats,
 
-        engine: Arc<dyn Engine>,
-
         table_root: Url,
 
         kernel_scan: Arc<KernelScan>,
@@ -78,7 +74,10 @@ pin_project! {
 
         file_selection: Option<&'a HashSet<String>>,
 
-        pub(crate) dv_stream: ReceiverStreamBuilder<(Url, Option<Vec<bool>>, Option<u64>)>,
+        // Deletion vectors found during replay, handed to the loader running
+        // alongside this stream. `None` once replay is done, which closes the
+        // channel and lets the loader finish.
+        dv_tx: Option<UnboundedSender<PendingDv>>,
 
         #[pin]
         stream: S,
@@ -87,22 +86,29 @@ pin_project! {
 
 impl<'a, S> ScanFileStream<'a, S> {
     pub(crate) fn new(
-        engine: Arc<dyn Engine>,
         scan: &Arc<Scan>,
         scan_config: DeltaScanConfig,
         file_selection: Option<&'a HashSet<String>>,
         stream: S,
+        dv_tx: UnboundedSender<PendingDv>,
     ) -> Self {
         Self {
             metrics: ReplayStats::new(),
-            dv_stream: ReceiverStreamBuilder::<(Url, Option<Vec<bool>>, Option<u64>)>::new(100),
-            engine,
+            dv_tx: Some(dv_tx),
             table_root: scan.table_root().clone(),
             kernel_scan: scan.inner().clone(),
             stream,
             scan_config,
             file_selection,
         }
+    }
+
+    /// Signal that replay found every deletion vector it is going to.
+    ///
+    /// Dropping the sender ends the loader's input stream; without this it would
+    /// wait for a producer that has already finished.
+    pub(crate) fn close_dv_input(&mut self) {
+        self.dv_tx = None;
     }
 }
 
@@ -144,25 +150,6 @@ where
                     Err(err) => return Poll::Ready(Some(Err(err.into()))),
                 };
 
-                // Spawn tasks to read the deletion vectors from disk.
-                for file in &ctx.files {
-                    if file.dv_info.has_vector() {
-                        let engine = this.engine.clone();
-                        let dv_info = file.dv_info.clone();
-                        let file_url = file.file_url.clone();
-                        let num_records = file.num_records;
-                        let table_root = this.table_root.clone();
-                        let tx = this.dv_stream.tx();
-
-                        let load_dv = move || {
-                            let dv = dv_info.get_selection_vector(engine.as_ref(), &table_root)?;
-                            let _ = tx.blocking_send(Ok((file_url, dv, num_records)));
-                            Ok(())
-                        };
-                        this.dv_stream.spawn_blocking(load_dv);
-                    }
-                }
-
                 this.metrics.num_scanned += ctx.count;
 
                 let (data, selection_vector) = scan_data.scan_files.into_parts();
@@ -183,6 +170,33 @@ where
                 // Parse statistics (will skip parsing for unreferenced columns)
                 let parsed_stats =
                     parse_stats_column_with_schema(snapshot.as_ref(), &scan_files, stats_schema)?;
+
+                // Hand this batch's deletion vectors to the loader running
+                // alongside us, which reads them with bounded concurrency. The
+                // send is synchronous and never blocks, so replay keeps going
+                // while the vectors are fetched.
+                //
+                // Read from the parsed batch, not the raw one: `num_records`
+                // comes from the parsed statistics, and taking the path,
+                // descriptor, and row count from a single row view keeps them
+                // consistent.
+                if let Some(tx) = this.dv_tx.as_ref() {
+                    for idx in 0..parsed_stats.num_rows() {
+                        let view = LogicalFileView::new(parsed_stats.clone(), idx);
+                        let Some(descriptor) = view.deletion_vector_descriptor() else {
+                            continue;
+                        };
+                        let file_url = match parse_path(this.table_root, view.path_raw()) {
+                            Ok(url) => url,
+                            Err(err) => return Poll::Ready(Some(Err(err.into()))),
+                        };
+                        let _ = tx.send(PendingDv {
+                            file_url,
+                            descriptor,
+                            num_records: view.num_records().map(|n| n as u64),
+                        });
+                    }
+                }
 
                 let mut file_statistics = extract_file_statistics(
                     this.kernel_scan,
@@ -395,10 +409,6 @@ struct ScanFileContextInner {
     pub size: u64,
     /// Transformations to apply to the data in the file.
     pub transform: Option<ExpressionRef>,
-    /// Number of records in the file from Add-file stats.
-    pub num_records: Option<u64>,
-
-    pub dv_info: DvInfo,
 }
 
 struct ScanContext {
@@ -487,11 +497,9 @@ fn visit_scan_file(ctx: &mut ScanContext, scan_file: ScanFile) {
     };
 
     ctx.files.push(ScanFileContextInner {
-        dv_info: scan_file.dv_info,
         transform: scan_file.transform,
         file_url,
         size: scan_file.size as u64,
-        num_records: scan_file.stats.map(|stats| stats.num_records),
     });
     ctx.count += 1;
 }

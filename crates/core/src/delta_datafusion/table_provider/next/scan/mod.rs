@@ -53,13 +53,15 @@ use datafusion_physical_expr_adapter::{
 use delta_kernel::{
     Engine, Expression, expressions::StructData, scan::ScanMetadata, table_features::TableFeature,
 };
-use futures::{Stream, TryStreamExt as _, future::ready};
+use futures::{Stream, TryStreamExt as _, try_join};
 use itertools::Itertools as _;
 use object_store::{ObjectMeta, path::Path};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use tokio::sync::mpsc;
 use tracing::debug;
 use url::Url;
 
+use self::dv::{into_keep_masks, load_deletion_vectors};
 pub use self::exec::DeltaScanExec;
 use self::exec_meta::DeltaScanMetaExec;
 pub(crate) use self::plan::{KernelScanPlan, ProjectedScanContract, supports_filters_pushdown};
@@ -75,6 +77,7 @@ use crate::{
     },
 };
 
+mod dv;
 mod exec;
 mod exec_meta;
 mod plan;
@@ -91,8 +94,15 @@ pub(super) async fn execution_plan(
     limit: Option<usize>,
     file_selection: Option<&FileSelection>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let (files, transforms, dvs, metrics) =
-        replay_files(engine, &scan_plan, config.clone(), stream, file_selection).await?;
+    let (files, transforms, dvs, metrics) = replay_files(
+        session,
+        engine,
+        &scan_plan,
+        config.clone(),
+        stream,
+        file_selection,
+    )
+    .await?;
 
     let file_id_field = scan_plan.contract.file_id_field.clone();
     if scan_plan.is_metadata_only() && !scan_plan.contract.retain_row_index {
@@ -134,40 +144,42 @@ pub(super) async fn execution_plan(
 
 /// Materialize deletion vector keep masks for every file in the scan that has one.
 ///
-/// Deletion vectors are loaded as a side-effect of consuming [`ScanFileStream`].  We drain the
-/// full stream here (discarding file contexts, stats, and partition values) because the DV
-/// loading tasks are spawned lazily during stream poll.  A dedicated DV-only stream that skips
-/// stats parsing is possible but not yet warranted — this path is not latency-sensitive and the
-/// file-list is typically small.
-///
-/// [`ReceiverStreamBuilder::build`] returns a merged stream that includes a JoinSet checker;
-/// `.try_collect().await` below will not complete until every spawned DV-loading task has
-/// finished, so no results are lost.
+/// Replay discovers the vectors and the loader fetches them, both running here
+/// at once so a vector is on its way as soon as its file is seen. We drain the
+/// full replay stream (discarding file contexts, stats, and partition values)
+/// because discovery is a side effect of polling it.
 pub(super) async fn replay_deletion_vectors(
+    session: &dyn Session,
     engine: Arc<dyn Engine>,
     scan_plan: &KernelScanPlan,
     config: &DeltaScanConfig,
     stream: ScanMetadataStream,
 ) -> Result<Vec<DeletionVectorSelection>> {
-    let mut stream = ScanFileStream::new(engine, &scan_plan.scan, config.clone(), None, stream);
-    while stream.try_next().await?.is_some() {}
+    let table_root = scan_plan.scan.table_root().clone();
+    let (dv_tx, dv_rx) = mpsc::unbounded_channel();
+    let mut stream = ScanFileStream::new(&scan_plan.scan, config.clone(), None, stream, dv_tx);
 
-    let dv_stream = stream.dv_stream.build();
-    // Only files with `dv_info.has_vector()` spawn tasks, so every item should carry a DV.
-    // Guard with a typed error (instead of panic) in case that invariant drifts.
-    let dvs: DashMap<_, _> = dv_stream
-        .and_then(|(url, dv, num_records)| {
-            ready(match dv {
-                Some(keep_mask) => normalize_dv_keep_mask_for_api(keep_mask, num_records, &url)
-                    .map(|mask| (url.to_string(), mask))
-                    .map_err(DeltaTableError::from),
-                None => Err(DeltaTableError::generic(
-                    "Invariant violation: DV task spawned for file without deletion vector",
-                )),
-            })
+    let replay = async {
+        while stream.try_next().await?.is_some() {}
+        stream.close_dv_input();
+        Ok::<_, DeltaTableError>(())
+    };
+    let load = load_deletion_vectors(Arc::clone(session.runtime_env()), engine, table_root, dv_rx);
+    let ((), loaded) = try_join!(replay, load)?;
+
+    // Only files with a deletion vector are queued, so every result should
+    // carry one. Guard with a typed error in case that invariant drifts.
+    let dvs: DashMap<_, _> = loaded
+        .into_iter()
+        .map(|(url, dv, num_records)| match dv {
+            Some(keep_mask) => normalize_dv_keep_mask_for_api(keep_mask, num_records, &url)
+                .map(|mask| (url.to_string(), mask))
+                .map_err(DeltaTableError::from),
+            None => Err(DeltaTableError::generic(
+                "Invariant violation: deletion vector queued for a file without one",
+            )),
         })
-        .try_collect()
-        .await?;
+        .collect::<std::result::Result<_, DeltaTableError>>()?;
 
     let mut vectors: Vec<_> = dvs
         .into_iter()
@@ -181,6 +193,7 @@ pub(super) async fn replay_deletion_vectors(
 }
 
 async fn replay_files(
+    session: &dyn Session,
     engine: Arc<dyn Engine>,
     scan_plan: &KernelScanPlan,
     scan_config: DeltaScanConfig,
@@ -192,17 +205,30 @@ async fn replay_files(
     DashMap<String, Vec<bool>>,
     ExecutionPlanMetricsSet,
 )> {
+    let table_root = scan_plan.scan.table_root().clone();
+    let (dv_tx, dv_rx) = mpsc::unbounded_channel();
     let mut stream = ScanFileStream::new(
-        engine,
         &scan_plan.scan,
         scan_config,
         file_selection.map(|selection| &selection.file_ids),
         stream,
+        dv_tx,
     );
-    let mut files = Vec::new();
-    while let Some(file) = stream.try_next().await? {
-        files.extend(file);
-    }
+
+    // Replay the file list and fetch deletion vectors at the same time: a
+    // vector starts loading as soon as replay reaches its file.
+    let (mut files, loaded_dvs) = try_join!(
+        async {
+            let mut files = Vec::new();
+            while let Some(file) = stream.try_next().await? {
+                files.extend(file);
+            }
+            stream.close_dv_input();
+            Ok::<_, DeltaTableError>(files)
+        },
+        load_deletion_vectors(Arc::clone(session.runtime_env()), engine, table_root, dv_rx)
+    )?;
+    let dvs = into_keep_masks(loaded_dvs);
 
     if let Some(selection) = file_selection
         && selection.missing_file_policy == super::MissingFilePolicy::Error
@@ -238,12 +264,6 @@ async fn replay_files(
                 .map(|t| (file.file_url.to_string(), t))
         })
         .collect();
-
-    let dv_stream = stream.dv_stream.build();
-    let dvs: DashMap<_, _> = dv_stream
-        .try_filter_map(|(url, dv, _)| ready(Ok(dv.map(|dv| (url.to_string(), dv)))))
-        .try_collect()
-        .await?;
 
     let metrics = ExecutionPlanMetricsSet::new();
     MetricBuilder::new(&metrics)

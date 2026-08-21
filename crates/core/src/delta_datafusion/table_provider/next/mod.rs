@@ -453,7 +453,7 @@ impl DeltaScan {
 
         let stream = self.scan_metadata_stream(&scan_plan, engine.clone());
 
-        scan::replay_deletion_vectors(engine, &scan_plan, &self.config, stream).await
+        scan::replay_deletion_vectors(session, engine, &scan_plan, &self.config, stream).await
     }
 
     fn scan_metadata_stream(

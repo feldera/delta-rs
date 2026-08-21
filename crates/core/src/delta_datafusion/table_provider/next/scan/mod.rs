@@ -64,14 +64,16 @@ use delta_kernel::{
     Engine, Expression, engine::arrow_data::ArrowEngineData, expressions::StructData,
     scan::ScanMetadata, table_features::TableFeature,
 };
-use futures::{Stream, StreamExt as _, TryStreamExt as _, future::ready};
+use futures::{Stream, StreamExt as _, TryStreamExt as _, try_join};
 use itertools::Itertools as _;
 use object_store::{ObjectMeta, path::Path};
 use parquet::arrow::RowNumber;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
+use tokio::sync::mpsc;
 use tracing::debug;
 use url::Url;
 
+use self::dv::load_deletion_vectors;
 pub use self::exec::DeltaScanExec;
 use self::exec::DvExecutionState;
 use self::exec_meta::DeltaScanMetaExec;
@@ -92,6 +94,7 @@ use crate::{
     kernel::LogicalFileView,
 };
 
+mod dv;
 mod exec;
 mod exec_meta;
 mod expr_adapter;
@@ -140,6 +143,7 @@ pub(super) async fn execution_plan(
     }
 
     let replayed = replay_files(
+        session,
         Arc::clone(&engine),
         &scan_plan,
         config.clone(),
@@ -214,41 +218,50 @@ pub(super) async fn execution_plan(
 
 /// Load deletion-vector keep masks for the selected files.
 ///
-/// Drain [`ScanFileStream`] to start the DV loading tasks, then collect their
-/// results through [`ReceiverStreamBuilder::build`]. A successful collection
-/// waits for all DV tasks to finish.
+/// Replay discovers the vectors and the loader fetches them, both running here
+/// at once so a vector is on its way as soon as its file is seen. We drain the
+/// full replay stream (discarding file contexts, stats, and partition values)
+/// because discovery is a side effect of polling it.
 pub(super) async fn replay_deletion_vectors(
+    session: &dyn Session,
     engine: Arc<dyn Engine>,
     scan_plan: &KernelScanPlan,
     config: &DeltaScanConfig,
     stream: ScanMetadataStream,
     file_selection: Option<&ResolvedFileSelection>,
 ) -> Result<Vec<DeletionVectorSelection>> {
+    let table_root = scan_plan.scan.table_root().clone();
+    let (dv_tx, dv_rx) = mpsc::unbounded_channel();
     let mut stream = ScanFileStream::new(
-        engine,
         &scan_plan.scan,
         config.clone(),
         file_selection.map(|selection| &selection.active_file_ids),
         stream,
+        dv_tx,
     );
-    while stream.try_next().await?.is_some() {}
 
-    let dv_stream = stream.dv_stream.build();
-    // A DV task must return a keep mask.
-    let dvs: DashMap<_, _> = dv_stream
-        .and_then(|(url, dv, num_records, cardinality)| {
-            ready(match dv {
-                Some(keep_mask) => validate_dv_mask(&keep_mask, num_records, cardinality, &url)
-                    .and_then(|()| normalize_dv_keep_mask_for_api(keep_mask, num_records, &url))
-                    .map(|mask| (url.to_string(), mask))
-                    .map_err(DeltaTableError::from),
-                None => Err(DeltaTableError::generic(
-                    "Invariant violation: DV task spawned for file without deletion vector",
-                )),
-            })
+    let replay = async {
+        while stream.try_next().await?.is_some() {}
+        stream.close_dv_input();
+        Ok::<_, DeltaTableError>(())
+    };
+    let load = load_deletion_vectors(Arc::clone(session.runtime_env()), engine, table_root, dv_rx);
+    let ((), loaded) = try_join!(replay, load)?;
+
+    // Only files with a deletion vector are queued, so every result should
+    // carry one. Guard with a typed error in case that invariant drifts.
+    let dvs: DashMap<_, _> = loaded
+        .into_iter()
+        .map(|(url, dv, num_records, cardinality)| match dv {
+            Some(keep_mask) => validate_dv_mask(&keep_mask, num_records, cardinality, &url)
+                .and_then(|()| normalize_dv_keep_mask_for_api(keep_mask, num_records, &url))
+                .map(|mask| (url.to_string(), mask))
+                .map_err(DeltaTableError::from),
+            None => Err(DeltaTableError::generic(
+                "Invariant violation: deletion vector queued for a file without one",
+            )),
         })
-        .try_collect()
-        .await?;
+        .collect::<std::result::Result<_, DeltaTableError>>()?;
 
     let mut vectors: Vec<_> = dvs
         .into_iter()
@@ -354,23 +367,49 @@ async fn for_each_selected_file(
 }
 
 async fn replay_files(
+    session: &dyn Session,
     engine: Arc<dyn Engine>,
     scan_plan: &KernelScanPlan,
     scan_config: DeltaScanConfig,
     stream: ScanMetadataStream,
     file_selection: Option<&ResolvedFileSelection>,
 ) -> Result<ReplayedScanFiles> {
+    let table_root = scan_plan.scan.table_root().clone();
+    let (dv_tx, dv_rx) = mpsc::unbounded_channel();
     let mut stream = ScanFileStream::new(
-        engine,
         &scan_plan.scan,
         scan_config,
         file_selection.map(|selection| &selection.active_file_ids),
         stream,
+        dv_tx,
     );
-    let mut files = Vec::new();
-    while let Some(file) = stream.try_next().await? {
-        files.extend(file);
-    }
+
+    // Replay the file list and fetch deletion vectors at the same time: a
+    // vector starts loading as soon as replay reaches its file.
+    let (mut files, loaded_dvs) = try_join!(
+        async {
+            let mut files = Vec::new();
+            while let Some(file) = stream.try_next().await? {
+                files.extend(file);
+            }
+            stream.close_dv_input();
+            Ok::<_, DeltaTableError>(files)
+        },
+        load_deletion_vectors(Arc::clone(session.runtime_env()), engine, table_root, dv_rx)
+    )?;
+    // Scan execution indexes by physical position, so no padding here. A
+    // queued file must come back with a vector.
+    let dvs_by_url: HashMap<_, _> = loaded_dvs
+        .into_iter()
+        .map(|(url, dv, num_records, cardinality)| match dv {
+            Some(mask) => validate_dv_mask(&mask, num_records, cardinality, &url)
+                .map(|()| (url.to_string(), mask))
+                .map_err(DeltaTableError::from),
+            None => Err(DeltaTableError::generic(
+                "Invariant violation: deletion vector queued for a file without one",
+            )),
+        })
+        .collect::<std::result::Result<_, DeltaTableError>>()?;
 
     let mut public_file_ids = PublicFileIdMap::default();
     if scan_plan.contract.retain_file_id {
@@ -392,20 +431,6 @@ async fn replay_files(
         })
         .collect();
 
-    let dv_stream = stream.dv_stream.build();
-    let dvs_by_url: HashMap<_, _> = dv_stream
-        .try_filter_map(|(url, dv, num_records, cardinality)| {
-            ready(match dv {
-                Some(mask) => validate_dv_mask(&mask, num_records, cardinality, &url)
-                    .map(|()| Some((url.to_string(), mask)))
-                    .map_err(DeltaTableError::from),
-                None => Err(DeltaTableError::generic(
-                    "Invariant violation: DV task returned no selection vector",
-                )),
-            })
-        })
-        .try_collect()
-        .await?;
     let dvs = remap_deletion_vectors_to_internal_file_ids(&files, dvs_by_url)?;
 
     let metrics = ExecutionPlanMetricsSet::new();

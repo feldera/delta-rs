@@ -1384,6 +1384,36 @@ mod tests {
     // DV test helpers
     const DV_TABLE_PATH: &str = "../../dat/v0.0.3/reader_tests/generated/deletion_vectors/delta";
 
+    /// Executing one deletion-vector scan plan twice must give the same rows.
+    ///
+    /// `consume_dv_mask` drains the per-file keep mask as batches arrive and
+    /// removes the entry once it is exhausted, and the masks live in a
+    /// `DashMap` shared by every execution of the plan. So the first execution
+    /// consumes them and the second finds none, reading the file unmasked and
+    /// resurrecting the rows the deletion vector deletes.
+    ///
+    /// Reproduces delta-io/delta-rs#4692.
+    #[tokio::test]
+    async fn dv_scan_repeated_execution_keeps_mask() -> TestResult {
+        let table = open_fs_path(DV_TABLE_PATH);
+        let provider = table.table_provider().await?;
+        let session = Arc::new(create_session().into_inner());
+        let scan = provider.scan(&session.state(), None, &[], None).await?;
+
+        let count = |batches: Vec<arrow_array::RecordBatch>| -> usize {
+            batches.iter().map(|b| b.num_rows()).sum()
+        };
+        let first = count(collect(Arc::clone(&scan), session.task_ctx()).await?);
+        let second = count(collect(Arc::clone(&scan), session.task_ctx()).await?);
+
+        assert_eq!(
+            first, second,
+            "re-executing the same deletion-vector scan returned {second} rows \
+             after {first}; the keep mask was consumed by the first execution"
+        );
+        Ok(())
+    }
+
     async fn dv_kernel_type_and_int32_scan_plan()
     -> TestResult<(KernelDataType, Arc<KernelScanPlan>)> {
         use arrow::datatypes::{Field, Schema};

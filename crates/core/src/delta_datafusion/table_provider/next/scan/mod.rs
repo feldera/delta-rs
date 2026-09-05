@@ -962,51 +962,6 @@ async fn get_read_plan(
         }
 
         let file_groups = partitioned_files_to_file_groups(files.into_iter().map(|file| file.0));
-
-        // Feldera: round-robin pre-split unpartitioned scans into target_partitions FileGroups.
-        //
-        // For unpartitioned tables, the single FileGroup that comes out of
-        // `partitioned_files_to_file_groups` is sliced round-robin into exactly
-        // `target_partitions` chunks before being handed to DataFusion. Files keep their
-        // natural log-replay order within each chunk; round-robin distribution
-        // interleaves the file list so the head files of all chunks cover the breadth
-        // of the table -- "mostly in order" ingestion at the consumer when files are
-        // roughly write-ordered.
-        //
-        // Splitting must produce *exactly* `target_partitions` groups (capped at
-        // `files.len()`); otherwise DataFusion sees `input_partitions != target_partitions`
-        // and adds its own `RepartitionExec(RoundRobinBatch)` on top, which we'd rather not.
-        //
-        // Enabled by default; disable with `DELTA_SCAN_ROUND_ROBIN=false` (or `=0`)
-        // to fall back to the upstream behavior. Useful if the new behavior ever
-        // surprises a consumer that depends on the old single-FileGroup shape.
-        //
-        // Applied BEFORE `compute_all_files_statistics` so each emitted file group's
-        // statistics are computed for its own slice.
-        let file_groups = {
-            let round_robin_enabled = !matches!(
-                std::env::var("DELTA_SCAN_ROUND_ROBIN")
-                    .ok()
-                    .as_deref()
-                    .map(str::to_ascii_lowercase)
-                    .as_deref(),
-                Some("false" | "0"),
-            );
-            let target_partitions = state.config().options().execution.target_partitions;
-            if round_robin_enabled && file_groups.len() == 1 && target_partitions > 1 {
-                let files = file_groups.into_iter().next().unwrap().into_inner();
-                let group_count = target_partitions.min(files.len()).max(1);
-                let mut groups: Vec<Vec<PartitionedFile>> =
-                    (0..group_count).map(|_| Vec::new()).collect();
-                for (i, file) in files.into_iter().enumerate() {
-                    groups[i % group_count].push(file);
-                }
-                groups.into_iter().map(FileGroup::from).collect()
-            } else {
-                file_groups
-            }
-        };
-
         let (file_groups, statistics) =
             compute_all_files_statistics(file_groups, full_table_schema, true, false)?;
 

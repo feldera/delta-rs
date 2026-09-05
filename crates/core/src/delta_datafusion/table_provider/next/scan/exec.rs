@@ -26,6 +26,7 @@ use datafusion::physical_plan::execution_plan::{CardinalityEffect, PlanPropertie
 use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
+    Distribution,
     DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, Statistics,
 };
 use datafusion_physical_expr_adapter::{
@@ -110,7 +111,8 @@ pub struct DeltaScanExec {
     input: Arc<dyn ExecutionPlan>,
     /// Transforms to be applied to data eminating from individual files
     transforms: Arc<HashMap<String, ExpressionRef>>,
-    /// Selection vectors to be applied to data read from individual files
+    /// Selection vectors to be applied to data read from individual files.
+    ///
     selection_vectors: Arc<DashMap<String, Vec<bool>>>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
@@ -145,6 +147,16 @@ impl DisplayAs for DeltaScanExec {
 }
 
 impl DeltaScanExec {
+    /// Whether any file in this scan carries a deletion vector.
+    ///
+    /// DV keep masks are consumed in physical row order, so a scan carrying any
+    /// must not be repartitioned, limited or fetched: each of those lets
+    /// DataFusion rewrite the child and slide the mask against the rows, which
+    /// drops the right *number* of rows at the wrong offsets.
+    fn has_deletion_vectors(&self) -> bool {
+        !self.selection_vectors.is_empty()
+    }
+
     pub(crate) fn new(
         scan_plan: Arc<KernelScanPlan>,
         input: Arc<dyn ExecutionPlan>,
@@ -281,6 +293,9 @@ impl ExecutionPlan for DeltaScanExec {
         target_partitions: usize,
         config: &ConfigOptions,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        if self.has_deletion_vectors() {
+            return Ok(None);
+        }
         if self.scan_plan.contract.retained_row_index_field().is_some() {
             // DeltaScanStream stores row ordinal counters per execution partition. Repartitioning
             // can split a file's rows across streams and break ordinal contiguity.
@@ -297,18 +312,47 @@ impl ExecutionPlan for DeltaScanExec {
         }
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        if self.scan_plan.contract.retained_row_index_field().is_some()
+            || self.has_deletion_vectors()
+        {
+            vec![Distribution::SinglePartition]
+        } else {
+            vec![Distribution::UnspecifiedDistribution]
+        }
+    }
+
     fn execute(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        // Normal planning enforces the single-partition requirement through
+        // EnforceDistribution; this catches callers that build DeltaScanExec
+        // directly or replace its child plan.
+        if self.has_deletion_vectors()
+            || self.scan_plan.contract.retained_row_index_field().is_some()
+        {
+            let partitions = self.input.properties().partitioning.partition_count();
+            if partitions > 1 {
+                return plan_err!(
+                    "DeltaScanExec requires a single input partition for deletion \
+                     vectors and retained row indexes, got {partitions}"
+                );
+            }
+        }
+
         Ok(Box::pin(DeltaScanStream {
             scan_plan: Arc::clone(&self.scan_plan),
             kernel_type: Arc::clone(self.scan_plan.scan.logical_schema()).into(),
             input: self.input.execute(partition, context)?,
             baseline_metrics: BaselineMetrics::new(&self.metrics, partition),
             transforms: Arc::clone(&self.transforms),
-            selection_vectors: Arc::clone(&self.selection_vectors),
+            selection_vectors: self
+                .selection_vectors
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.value().clone()))
+                .collect(),
             input_file_id_column: self.input_file_id_column.clone(),
             file_id_column: self.file_id_column.clone(),
             row_index_field: self.scan_plan.contract.retained_row_index_field(),
@@ -325,7 +369,7 @@ impl ExecutionPlan for DeltaScanExec {
     }
 
     fn supports_limit_pushdown(&self) -> bool {
-        self.input.supports_limit_pushdown()
+        !self.has_deletion_vectors() && self.input.supports_limit_pushdown()
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -337,6 +381,9 @@ impl ExecutionPlan for DeltaScanExec {
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        if self.has_deletion_vectors() {
+            return None;
+        }
         let new_input = self.input.with_fetch(limit)?;
         let mut new_plan = self.clone();
         new_plan.input = new_input;
@@ -416,7 +463,10 @@ struct DeltaScanStream {
     /// Transforms to be applied to data read from individual files
     transforms: Arc<HashMap<String, ExpressionRef>>,
     /// Selection vectors to be applied to data read from individual files
-    selection_vectors: Arc<DashMap<String, Vec<bool>>>,
+    /// Owned per stream, not shared: `consume_dv_mask` drains this as batches
+    /// arrive, so a map shared across executions is emptied by the first one and
+    /// every later execution reads its files unmasked.
+    selection_vectors: HashMap<String, Vec<bool>>,
     /// File id column name carried by the input batches for per file correlation.
     input_file_id_column: String,
     /// User-visible file-id column name when projected in the output.

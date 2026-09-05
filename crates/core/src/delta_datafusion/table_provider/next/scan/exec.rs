@@ -1471,8 +1471,8 @@ mod tests {
         Ok((kernel_type, Arc::new(scan_plan)))
     }
 
-    fn selection_vectors_f1_f2() -> Arc<DashMap<String, Vec<bool>>> {
-        let selection_vectors: Arc<DashMap<String, Vec<bool>>> = Arc::new(DashMap::new());
+    fn selection_vectors_f1_f2() -> HashMap<String, Vec<bool>> {
+        let mut selection_vectors: HashMap<String, Vec<bool>> = HashMap::new();
         selection_vectors.insert("f1".to_string(), vec![true, false]);
         selection_vectors.insert("f2".to_string(), vec![false, true]);
         selection_vectors
@@ -1519,7 +1519,7 @@ mod tests {
     fn test_scan_stream(
         scan_plan: Arc<KernelScanPlan>,
         kernel_type: KernelDataType,
-        selection_vectors: Arc<DashMap<String, Vec<bool>>>,
+        selection_vectors: HashMap<String, Vec<bool>>,
         input_batches: Vec<RecordBatch>,
         file_id_column: Option<String>,
     ) -> DeltaScanStream {
@@ -1585,7 +1585,7 @@ mod tests {
         let mut stream = test_scan_stream(
             scan_plan,
             kernel_type,
-            Arc::new(DashMap::new()),
+            HashMap::new(),
             Vec::new(),
             None,
         );
@@ -1611,7 +1611,7 @@ mod tests {
         let mut stream = test_scan_stream(
             scan_plan,
             kernel_type,
-            Arc::new(DashMap::new()),
+            HashMap::new(),
             Vec::new(),
             None,
         );
@@ -1636,7 +1636,7 @@ mod tests {
         let mut stream = test_scan_stream(
             scan_plan,
             kernel_type,
-            Arc::new(DashMap::new()),
+            HashMap::new(),
             vec![first, second],
             None,
         );
@@ -1768,7 +1768,7 @@ mod tests {
         let mut stream = test_scan_stream(
             Arc::clone(&scan_plan),
             kernel_type,
-            Arc::new(DashMap::new()),
+            HashMap::new(),
             Vec::new(),
             None,
         );
@@ -1792,7 +1792,7 @@ mod tests {
         let mut stream = test_scan_stream(
             Arc::clone(&scan_plan),
             kernel_type,
-            Arc::new(DashMap::new()),
+            HashMap::new(),
             Vec::new(),
             None,
         );

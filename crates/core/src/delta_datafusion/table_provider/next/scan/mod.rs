@@ -82,6 +82,7 @@ mod exec;
 mod exec_meta;
 mod plan;
 mod replay;
+mod whole_file_source;
 
 type ScanMetadataStream = Pin<Box<dyn Stream<Item = Result<ScanMetadata, DeltaTableError>> + Send>>;
 
@@ -319,6 +320,7 @@ async fn get_data_scan_plan(
     metrics: ExecutionPlanMetricsSet,
     limit: Option<usize>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
+    let has_deletion_vectors = !dvs.is_empty();
     let mut partition_stats = HashMap::new();
 
     // Convert the files into datafusions `PartitionedFile`s grouped by the object store they are stored in
@@ -345,10 +347,7 @@ async fn get_data_scan_plan(
         // on `partition_values`, so partition values must be set first.
         partitioned_file.partition_values = vec![file_value.clone()];
         partitioned_file = partitioned_file.with_statistics(Arc::new(f.stats));
-        Ok::<_, DataFusionError>((
-            f.file_url.as_object_store_url(),
-            (partitioned_file, None::<Vec<bool>>),
-        ))
+        Ok::<_, DataFusionError>((f.file_url.as_object_store_url(), partitioned_file))
     };
 
     // Group the files by their object store url. Since datafusion assumes that all files in a
@@ -358,7 +357,9 @@ async fn get_data_scan_plan(
         .map(to_partitioned_file)
         .try_collect::<_, Vec<_>, _>()?
         .into_iter()
-        .into_group_map();
+        .into_group_map()
+        .into_iter()
+        .map(|(store, files)| (store, files, has_deletion_vectors));
 
     // TODO(roeap); not sure exactly how row tracking is implemented in kernel right now
     // so leaving predicate as None for now until we are sure this is safe to do.
@@ -428,7 +429,7 @@ fn update_partition_stats(
     Ok(())
 }
 
-type FilesByStore = (ObjectStoreUrl, Vec<(PartitionedFile, Option<Vec<bool>>)>);
+type FilesByStore = (ObjectStoreUrl, Vec<PartitionedFile>, bool);
 
 /// Maximum number of distinct values representable by DataFusion's default partition dictionary
 /// encoding (`Dictionary<UInt16, _>`).
@@ -901,7 +902,7 @@ async fn get_read_plan(
     let parquet_predicate_df_schema = parquet_predicate_schema.clone().to_dfschema()?;
     let adapter_factory = Arc::new(FieldIdAlignedExprAdapterFactory::default());
 
-    for (store_url, files) in files_by_store.into_iter() {
+    for (store_url, files, has_deletion_vectors) in files_by_store.into_iter() {
         let reader_factory = Arc::new(CachedParquetFileReaderFactory::new(
             state.runtime_env().object_store(&store_url)?,
             state.runtime_env().cache_manager.get_file_metadata_cache(),
@@ -920,8 +921,7 @@ async fn get_read_plan(
         // TODO(roeap); we might be able to also push selection vectors into the read plan
         // by creating parquet access plans. However we need to make sure this does not
         // interfere with other delta features like row ids.
-        let has_selection_vectors = files.iter().any(|(_, sv)| sv.is_some());
-        if !has_selection_vectors && let Some(pred) = predicate {
+        if !has_deletion_vectors && let Some(pred) = predicate {
             match state.create_physical_expr(pred.clone(), &parquet_predicate_df_schema) {
                 Ok(physical) => match adapter_factory
                     .create(parquet_predicate_schema.clone(), full_read_schema.clone())
@@ -961,14 +961,24 @@ async fn get_read_plan(
             }
         }
 
-        let file_groups = partitioned_files_to_file_groups(files.into_iter().map(|file| file.0));
+        let file_groups = partitioned_files_to_file_groups(files);
         let (file_groups, statistics) =
             compute_all_files_statistics(file_groups, full_table_schema, true, false)?;
 
-        let config = FileScanConfigBuilder::new(store_url, Arc::new(file_source))
+        // Keep masks are consumed in physical row order, so for a scan that
+        // carries them the source must not split, filter or reorder underneath
+        // `DeltaScanExec`.
+        let file_source: Arc<dyn datafusion::datasource::physical_plan::FileSource> =
+            if has_deletion_vectors {
+                whole_file_source::keep_files_whole(Arc::new(file_source))
+            } else {
+                Arc::new(file_source)
+            };
+
+        let config = FileScanConfigBuilder::new(store_url, file_source)
             .with_file_groups(file_groups)
             .with_statistics(statistics)
-            .with_limit(limit)
+            .with_limit(if has_deletion_vectors { None } else { limit })
             .with_expr_adapter(Some(adapter_factory.clone() as _))
             .build();
 
@@ -1589,7 +1599,7 @@ mod tests {
 
         let files_by_store = vec![(
             store_url.as_object_store_url(),
-            vec![(file, None::<Vec<bool>>)],
+            vec![file], false,
         )];
 
         let file_id_field =
@@ -1717,7 +1727,7 @@ mod tests {
 
         let files_by_store = vec![(
             store_url.as_object_store_url(),
-            vec![(file, None::<Vec<bool>>)],
+            vec![file], false,
         )];
 
         let file_id_field =
@@ -1848,11 +1858,11 @@ mod tests {
         let files_by_store = vec![
             (
                 store_url_1.as_object_store_url(),
-                vec![(file_1, None::<Vec<bool>>)],
+                vec![file_1], false,
             ),
             (
                 store_url_2.as_object_store_url(),
-                vec![(file_2, None::<Vec<bool>>)],
+                vec![file_2], false,
             ),
         ];
 
@@ -1919,7 +1929,7 @@ mod tests {
 
         let files_by_store = vec![(
             store_url.as_object_store_url(),
-            vec![(file, None::<Vec<bool>>)],
+            vec![file], false,
         )];
 
         let file_id_field =
@@ -1985,7 +1995,7 @@ mod tests {
 
         let files_by_store = vec![(
             store_url.as_object_store_url(),
-            vec![(file, None::<Vec<bool>>)],
+            vec![file], false,
         )];
 
         let file_id_field =
@@ -2064,7 +2074,7 @@ mod tests {
 
         let files_by_store = vec![(
             store_url.as_object_store_url(),
-            vec![(file, None::<Vec<bool>>)],
+            vec![file], false,
         )];
 
         let file_id_field =
@@ -2140,7 +2150,7 @@ mod tests {
 
         let files_by_store = vec![(
             store_url.as_object_store_url(),
-            vec![(file, None::<Vec<bool>>)],
+            vec![file], false,
         )];
 
         let file_id_field =
@@ -2217,7 +2227,7 @@ mod tests {
 
         let files_by_store = vec![(
             store_url.as_object_store_url(),
-            vec![(file, None::<Vec<bool>>)],
+            vec![file], false,
         )];
 
         let file_id_field =
@@ -2306,7 +2316,7 @@ mod tests {
 
         let files_by_store = vec![(
             store_url.as_object_store_url(),
-            vec![(file, None::<Vec<bool>>)],
+            vec![file], false,
         )];
 
         let file_id_field =

@@ -149,6 +149,11 @@ name = "it_datafusion"
 path = "tests/it_datafusion/main.rs"
 required-features = ["datafusion"]
 
+[[test]]
+name = "dv_scan_row_order"
+path = "tests/dv_scan_row_order.rs"
+required-features = ["datafusion"]
+
 [[bench]]
 name = "json_parsing"
 harness = false

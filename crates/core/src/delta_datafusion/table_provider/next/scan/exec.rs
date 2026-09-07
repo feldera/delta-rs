@@ -26,6 +26,7 @@ use datafusion::physical_plan::execution_plan::{CardinalityEffect, PlanPropertie
 use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
+    Distribution,
     DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, Statistics,
 };
 use datafusion_physical_expr_adapter::{
@@ -110,7 +111,8 @@ pub struct DeltaScanExec {
     input: Arc<dyn ExecutionPlan>,
     /// Transforms to be applied to data eminating from individual files
     transforms: Arc<HashMap<String, ExpressionRef>>,
-    /// Selection vectors to be applied to data read from individual files
+    /// Selection vectors to be applied to data read from individual files.
+    ///
     selection_vectors: Arc<DashMap<String, Vec<bool>>>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
@@ -145,6 +147,16 @@ impl DisplayAs for DeltaScanExec {
 }
 
 impl DeltaScanExec {
+    /// Whether any file in this scan carries a deletion vector.
+    ///
+    /// DV keep masks are consumed in physical row order, so a scan carrying any
+    /// must not be repartitioned, limited or fetched: each of those lets
+    /// DataFusion rewrite the child and slide the mask against the rows, which
+    /// drops the right *number* of rows at the wrong offsets.
+    fn has_deletion_vectors(&self) -> bool {
+        !self.selection_vectors.is_empty()
+    }
+
     pub(crate) fn new(
         scan_plan: Arc<KernelScanPlan>,
         input: Arc<dyn ExecutionPlan>,
@@ -281,6 +293,9 @@ impl ExecutionPlan for DeltaScanExec {
         target_partitions: usize,
         config: &ConfigOptions,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        if self.has_deletion_vectors() {
+            return Ok(None);
+        }
         if self.scan_plan.contract.retained_row_index_field().is_some() {
             // DeltaScanStream stores row ordinal counters per execution partition. Repartitioning
             // can split a file's rows across streams and break ordinal contiguity.
@@ -297,18 +312,47 @@ impl ExecutionPlan for DeltaScanExec {
         }
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        if self.scan_plan.contract.retained_row_index_field().is_some()
+            || self.has_deletion_vectors()
+        {
+            vec![Distribution::SinglePartition]
+        } else {
+            vec![Distribution::UnspecifiedDistribution]
+        }
+    }
+
     fn execute(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        // Normal planning enforces the single-partition requirement through
+        // EnforceDistribution; this catches callers that build DeltaScanExec
+        // directly or replace its child plan.
+        if self.has_deletion_vectors()
+            || self.scan_plan.contract.retained_row_index_field().is_some()
+        {
+            let partitions = self.input.properties().partitioning.partition_count();
+            if partitions > 1 {
+                return plan_err!(
+                    "DeltaScanExec requires a single input partition for deletion \
+                     vectors and retained row indexes, got {partitions}"
+                );
+            }
+        }
+
         Ok(Box::pin(DeltaScanStream {
             scan_plan: Arc::clone(&self.scan_plan),
             kernel_type: Arc::clone(self.scan_plan.scan.logical_schema()).into(),
             input: self.input.execute(partition, context)?,
             baseline_metrics: BaselineMetrics::new(&self.metrics, partition),
             transforms: Arc::clone(&self.transforms),
-            selection_vectors: Arc::clone(&self.selection_vectors),
+            selection_vectors: self
+                .selection_vectors
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.value().clone()))
+                .collect(),
             input_file_id_column: self.input_file_id_column.clone(),
             file_id_column: self.file_id_column.clone(),
             row_index_field: self.scan_plan.contract.retained_row_index_field(),
@@ -325,7 +369,7 @@ impl ExecutionPlan for DeltaScanExec {
     }
 
     fn supports_limit_pushdown(&self) -> bool {
-        self.input.supports_limit_pushdown()
+        !self.has_deletion_vectors() && self.input.supports_limit_pushdown()
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -337,6 +381,9 @@ impl ExecutionPlan for DeltaScanExec {
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        if self.has_deletion_vectors() {
+            return None;
+        }
         let new_input = self.input.with_fetch(limit)?;
         let mut new_plan = self.clone();
         new_plan.input = new_input;
@@ -355,6 +402,17 @@ impl ExecutionPlan for DeltaScanExec {
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
     ) -> Result<FilterDescription> {
+        // A filter pushed past this node is evaluated inside the Parquet
+        // reader, which drops rows before the keep mask is applied to them.
+        // The mask is positional, so the rows that remain no longer line up
+        // with it and the scan returns the wrong records.
+        if self.has_deletion_vectors() {
+            return Ok(FilterDescription::all_unsupported(
+                &parent_filters,
+                &self.children(),
+            ));
+        }
+
         // Parent filters are bound against the logical output schema. For column mapped tables
         // the child parquet schema uses physical column names, so pushing the parent filter
         // through this exec again can rewrite it against the wrong child field. Provider level
@@ -416,7 +474,10 @@ struct DeltaScanStream {
     /// Transforms to be applied to data read from individual files
     transforms: Arc<HashMap<String, ExpressionRef>>,
     /// Selection vectors to be applied to data read from individual files
-    selection_vectors: Arc<DashMap<String, Vec<bool>>>,
+    /// Owned per stream, not shared: `consume_dv_mask` drains this as batches
+    /// arrive, so a map shared across executions is emptied by the first one and
+    /// every later execution reads its files unmasked.
+    selection_vectors: HashMap<String, Vec<bool>>,
     /// File id column name carried by the input batches for per file correlation.
     input_file_id_column: String,
     /// User-visible file-id column name when projected in the output.
@@ -1334,6 +1395,36 @@ mod tests {
     // DV test helpers
     const DV_TABLE_PATH: &str = "../../dat/v0.0.3/reader_tests/generated/deletion_vectors/delta";
 
+    /// Executing one deletion-vector scan plan twice must give the same rows.
+    ///
+    /// `consume_dv_mask` drains the per-file keep mask as batches arrive and
+    /// removes the entry once it is exhausted, and the masks live in a
+    /// `DashMap` shared by every execution of the plan. So the first execution
+    /// consumes them and the second finds none, reading the file unmasked and
+    /// resurrecting the rows the deletion vector deletes.
+    ///
+    /// Reproduces delta-io/delta-rs#4692.
+    #[tokio::test]
+    async fn dv_scan_repeated_execution_keeps_mask() -> TestResult {
+        let table = open_fs_path(DV_TABLE_PATH);
+        let provider = table.table_provider().await?;
+        let session = Arc::new(create_session().into_inner());
+        let scan = provider.scan(&session.state(), None, &[], None).await?;
+
+        let count = |batches: Vec<arrow_array::RecordBatch>| -> usize {
+            batches.iter().map(|b| b.num_rows()).sum()
+        };
+        let first = count(collect(Arc::clone(&scan), session.task_ctx()).await?);
+        let second = count(collect(Arc::clone(&scan), session.task_ctx()).await?);
+
+        assert_eq!(
+            first, second,
+            "re-executing the same deletion-vector scan returned {second} rows \
+             after {first}; the keep mask was consumed by the first execution"
+        );
+        Ok(())
+    }
+
     async fn dv_kernel_type_and_int32_scan_plan()
     -> TestResult<(KernelDataType, Arc<KernelScanPlan>)> {
         use arrow::datatypes::{Field, Schema};
@@ -1391,8 +1482,8 @@ mod tests {
         Ok((kernel_type, Arc::new(scan_plan)))
     }
 
-    fn selection_vectors_f1_f2() -> Arc<DashMap<String, Vec<bool>>> {
-        let selection_vectors: Arc<DashMap<String, Vec<bool>>> = Arc::new(DashMap::new());
+    fn selection_vectors_f1_f2() -> HashMap<String, Vec<bool>> {
+        let mut selection_vectors: HashMap<String, Vec<bool>> = HashMap::new();
         selection_vectors.insert("f1".to_string(), vec![true, false]);
         selection_vectors.insert("f2".to_string(), vec![false, true]);
         selection_vectors
@@ -1439,7 +1530,7 @@ mod tests {
     fn test_scan_stream(
         scan_plan: Arc<KernelScanPlan>,
         kernel_type: KernelDataType,
-        selection_vectors: Arc<DashMap<String, Vec<bool>>>,
+        selection_vectors: HashMap<String, Vec<bool>>,
         input_batches: Vec<RecordBatch>,
         file_id_column: Option<String>,
     ) -> DeltaScanStream {
@@ -1505,7 +1596,7 @@ mod tests {
         let mut stream = test_scan_stream(
             scan_plan,
             kernel_type,
-            Arc::new(DashMap::new()),
+            HashMap::new(),
             Vec::new(),
             None,
         );
@@ -1531,7 +1622,7 @@ mod tests {
         let mut stream = test_scan_stream(
             scan_plan,
             kernel_type,
-            Arc::new(DashMap::new()),
+            HashMap::new(),
             Vec::new(),
             None,
         );
@@ -1556,7 +1647,7 @@ mod tests {
         let mut stream = test_scan_stream(
             scan_plan,
             kernel_type,
-            Arc::new(DashMap::new()),
+            HashMap::new(),
             vec![first, second],
             None,
         );
@@ -1688,7 +1779,7 @@ mod tests {
         let mut stream = test_scan_stream(
             Arc::clone(&scan_plan),
             kernel_type,
-            Arc::new(DashMap::new()),
+            HashMap::new(),
             Vec::new(),
             None,
         );
@@ -1712,7 +1803,7 @@ mod tests {
         let mut stream = test_scan_stream(
             Arc::clone(&scan_plan),
             kernel_type,
-            Arc::new(DashMap::new()),
+            HashMap::new(),
             Vec::new(),
             None,
         );

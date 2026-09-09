@@ -75,7 +75,7 @@ use url::Url;
 pub use self::exec::DeltaScanExec;
 use self::exec::DvExecutionState;
 use self::exec_meta::DeltaScanMetaExec;
-use self::expr_adapter::{DeltaPhysicalExprAdapterFactory, relax_schema_nested_nullability};
+use self::expr_adapter::{FieldIdAlignedExprAdapterFactory, relax_schema_nested_nullability};
 pub(crate) use self::plan::{KernelScanPlan, ProjectedScanContract, supports_filters_pushdown};
 use self::replay::{ScanFileContext, ScanFileStream};
 pub(crate) use self::runtime_filter::RuntimeFileFilter;
@@ -943,7 +943,7 @@ async fn get_read_plan(
     full_read_schema.push(file_id_field.as_ref().clone().with_nullable(true));
     let full_read_schema = Arc::new(full_read_schema.finish());
     let parquet_predicate_df_schema = parquet_predicate_schema.clone().to_dfschema()?;
-    let adapter_factory = Arc::new(DeltaPhysicalExprAdapterFactory);
+    let adapter_factory = Arc::new(FieldIdAlignedExprAdapterFactory::default());
 
     for (store_url, files, has_deletion_vectors, scan_cache) in files_by_store.into_iter() {
         let store = state.runtime_env().object_store(&store_url)?;
@@ -1120,7 +1120,7 @@ impl SchemaAdapter {
     fn new(target_schema: SchemaRef) -> Self {
         Self {
             factory: BatchAdapterFactory::new(target_schema)
-                .with_adapter_factory(Arc::new(DeltaPhysicalExprAdapterFactory)),
+                .with_adapter_factory(Arc::new(FieldIdAlignedExprAdapterFactory::default())),
             cached_source: None,
             cached_adapter: None,
         }

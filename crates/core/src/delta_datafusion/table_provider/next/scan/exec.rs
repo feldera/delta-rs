@@ -42,7 +42,7 @@ use delta_kernel::{EvaluationHandler, ExpressionRef};
 use futures::TryStreamExt as _;
 use futures::stream::{Stream, StreamExt};
 
-use super::expr_adapter::DeltaPhysicalExprAdapterFactory;
+use super::expr_adapter::FieldIdAlignedExprAdapterFactory;
 use super::plan::KernelScanPlan;
 use super::runtime_filter::RuntimeScanFilePruner;
 use crate::delta_datafusion::file_id::file_id_field;
@@ -660,7 +660,7 @@ impl ExecutionPlan for DeltaScanExec {
             ));
         }
 
-        let adapter_factory = DeltaPhysicalExprAdapterFactory;
+        let adapter_factory = FieldIdAlignedExprAdapterFactory::default();
         let adapted_filters = adapter_factory
             .create(
                 Arc::clone(&self.scan_plan.contract.result_schema),

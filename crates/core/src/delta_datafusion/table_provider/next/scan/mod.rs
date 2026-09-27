@@ -667,17 +667,60 @@ fn align_type_to_file_names(read: &DataType, file: &DataType) -> DataType {
                 .collect();
             Struct(aligned.into())
         }
-        (List(read_inner), List(file_inner)) => List(Arc::new(align_field_to_file(
-            read_inner, file_inner,
-        ))),
-        (LargeList(read_inner), LargeList(file_inner)) => {
-            LargeList(Arc::new(align_field_to_file(read_inner, file_inner)))
-        }
+        // The log and the file need not agree on the list flavor, so match on any
+        // pairing: only names change here, and the cast that follows handles the
+        // offset width.
+        (List(read_inner), _) => match list_element(file) {
+            Some(file_inner) => List(Arc::new(align_field_to_file(read_inner, file_inner))),
+            None => read.clone(),
+        },
+        (LargeList(read_inner), _) => match list_element(file) {
+            Some(file_inner) => LargeList(Arc::new(align_field_to_file(read_inner, file_inner))),
+            None => read.clone(),
+        },
         (Map(read_entries, sorted), Map(file_entries, _)) => {
-            Map(Arc::new(align_field_to_file(read_entries, file_entries)), *sorted)
+            Map(Arc::new(align_map_entries(read_entries, file_entries)), *sorted)
         }
         _ => read.clone(),
     }
+}
+
+/// The element field of a `List` or a `LargeList`, the two flavors a Delta array
+/// arrives as; `None` for any other type.
+fn list_element(data_type: &DataType) -> Option<&FieldRef> {
+    match data_type {
+        DataType::List(inner) | DataType::LargeList(inner) => Some(inner),
+        _ => None,
+    }
+}
+
+/// A map's `entries`, `key` and `value` fields relabeled to the file's names.
+///
+/// Delta assigns a column mapping id to the map itself, not to the three fields
+/// that spell out its layout, so [`align_type_to_file_names`]'s struct arm finds no
+/// id to pair them on. Both sides always hold a key and a value in that order, so
+/// pair them by position and recurse, which reaches the ids the value's own struct
+/// children do carry.
+fn align_map_entries(read: &FieldRef, file: &FieldRef) -> Field {
+    let aligned = match (read.data_type(), file.data_type()) {
+        (DataType::Struct(read_children), DataType::Struct(file_children))
+            if read_children.len() == file_children.len() =>
+        {
+            let children: Vec<FieldRef> = read_children
+                .iter()
+                .zip(file_children)
+                .map(|(read_child, file_child)| {
+                    Arc::new(align_field_to_file(read_child, file_child))
+                })
+                .collect();
+            DataType::Struct(children.into())
+        }
+        _ => read.data_type().clone(),
+    };
+    read.as_ref()
+        .clone()
+        .with_name(file.name())
+        .with_data_type(aligned)
 }
 
 fn field_id(field: &Field) -> Option<&str> {
@@ -1161,6 +1204,123 @@ mod tests {
         // rename suffices).
         assert!(alignment.realign_targets.contains_key("col-103"));
         assert!(!alignment.realign_targets.contains_key("col-102"));
+    }
+
+    /// A struct inside a list must be relabeled even when the log and the file
+    /// disagree on the list flavor. Left unrelabeled, its `col-<id>` children
+    /// overlap none of the file's names and the struct cast pairs them by
+    /// position, silently swapping reordered fields (feldera/feldera#7279).
+    #[test]
+    fn test_align_read_schema_relabels_a_list_element_across_list_flavors() {
+        let element = |children: Vec<Field>| {
+            Field::new("element", DataType::Struct(children.into()), true)
+        };
+        // The log lists the children in the opposite order to the file, which is
+        // what a field reorder leaves behind.
+        let read = Schema::new(vec![
+            Field::new(
+                "col-105",
+                DataType::List(Arc::new(element(vec![
+                    field_with_id("col-107", "107", true),
+                    field_with_id("col-106", "106", true),
+                ]))),
+                true,
+            )
+            .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), "105".to_string())].into()),
+        ]);
+        let file = Schema::new(vec![
+            Field::new(
+                "history",
+                DataType::LargeList(Arc::new(element(vec![
+                    field_with_id("merchant", "106", true),
+                    field_with_id("status", "107", true),
+                ]))),
+                true,
+            )
+            .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), "105".to_string())].into()),
+        ]);
+
+        let alignment = align_read_schema_to_file_names(&read, &file);
+
+        // The read flavor is kept -- only names change here -- and each child takes
+        // the file name sharing its id, in the read's order.
+        match alignment.file_aligned_read_schema.field(0).data_type() {
+            DataType::List(inner) => match inner.data_type() {
+                DataType::Struct(children) => {
+                    assert_eq!(children[0].name(), "status");
+                    assert_eq!(children[1].name(), "merchant");
+                }
+                other => panic!("expected a struct element, got {other:?}"),
+            },
+            other => panic!("expected a list, got {other:?}"),
+        }
+        // Nested names diverge, so the column is rebuilt by field id afterwards.
+        assert!(alignment.realign_targets.contains_key("col-105"));
+    }
+
+    /// A map's `entries`, `key` and `value` carry no column-mapping id, so pairing
+    /// them by field id skips the value's struct entirely and leaves its children
+    /// unrelabeled -- the same silent swap as the list case above.
+    #[test]
+    fn test_align_read_schema_relabels_a_map_value_struct() {
+        let entries = |value_children: Vec<Field>| {
+            Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", DataType::Struct(value_children.into()), true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )
+        };
+        let read = Schema::new(vec![
+            Field::new(
+                "col-108",
+                DataType::Map(
+                    Arc::new(entries(vec![
+                        field_with_id("col-112", "112", true),
+                        field_with_id("col-111", "111", true),
+                    ])),
+                    false,
+                ),
+                true,
+            )
+            .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), "108".to_string())].into()),
+        ]);
+        let file = Schema::new(vec![
+            Field::new(
+                "tags",
+                DataType::Map(
+                    Arc::new(entries(vec![
+                        field_with_id("merchant", "111", true),
+                        field_with_id("status", "112", true),
+                    ])),
+                    false,
+                ),
+                true,
+            )
+            .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), "108".to_string())].into()),
+        ]);
+
+        let alignment = align_read_schema_to_file_names(&read, &file);
+
+        match alignment.file_aligned_read_schema.field(0).data_type() {
+            DataType::Map(entries, _) => match entries.data_type() {
+                DataType::Struct(key_value) => match key_value[1].data_type() {
+                    DataType::Struct(children) => {
+                        assert_eq!(children[0].name(), "status");
+                        assert_eq!(children[1].name(), "merchant");
+                    }
+                    other => panic!("expected a struct value, got {other:?}"),
+                },
+                other => panic!("expected key/value entries, got {other:?}"),
+            },
+            other => panic!("expected a map, got {other:?}"),
+        }
+        assert!(alignment.realign_targets.contains_key("col-108"));
     }
 
     #[test]

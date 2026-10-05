@@ -890,6 +890,33 @@ fn file_id_array_for_value(
 /// encoding (`Dictionary<UInt16, _>`).
 const MAX_PARTITION_DICT_CARDINALITY: usize = (u16::MAX as usize) + 1;
 
+/// Split a lone file group round-robin across `target_partitions`.
+///
+/// Files stay whole, which scan row ordinals require, and groups only get
+/// smaller, so the dictionary cap in [`partitioned_files_to_file_groups`] still
+/// holds.
+fn round_robin_split(file_groups: Vec<FileGroup>, target_partitions: usize) -> Vec<FileGroup> {
+    let disabled = matches!(
+        std::env::var("DELTA_SCAN_ROUND_ROBIN")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("false" | "0")
+    );
+    if disabled || file_groups.len() != 1 || target_partitions < 2 {
+        return file_groups;
+    }
+
+    let files = file_groups.into_iter().next().unwrap().into_inner();
+    let group_count = target_partitions.min(files.len()).max(1);
+    let mut groups: Vec<Vec<PartitionedFile>> = vec![Vec::new(); group_count];
+    for (index, file) in files.into_iter().enumerate() {
+        groups[index % group_count].push(file);
+    }
+    groups.into_iter().map(FileGroup::from).collect()
+}
+
 fn partitioned_files_to_file_groups(
     files: impl IntoIterator<Item = PartitionedFile>,
 ) -> Vec<FileGroup> {
@@ -1048,6 +1075,16 @@ async fn get_read_plan(
         }
 
         let file_groups = partitioned_files_to_file_groups(files);
+        // Feldera: split the single unpartitioned file group round-robin into
+        // exactly `target_partitions` groups. DataFusion only byte-range splits a
+        // group once the table reaches `repartition_file_min_size` (10 MiB), so a
+        // small table with many files is otherwise read by one thread, one file at
+        // a time. Exactly `target_partitions`, or DataFusion stacks its own
+        // RepartitionExec on top. `DELTA_SCAN_ROUND_ROBIN=false` restores upstream.
+        let file_groups = round_robin_split(
+            file_groups,
+            state.config().options().execution.target_partitions,
+        );
         let (file_groups, statistics) =
             compute_all_files_statistics(file_groups, full_table_schema, true, false)?;
 
@@ -1206,6 +1243,41 @@ mod tests {
     };
 
     use super::{plan::build_parquet_predicate_schema, *};
+
+    #[test]
+    fn test_round_robin_split_produces_exactly_target_partitions() {
+        let files = (0..7)
+            .map(|i| PartitionedFile::new(format!("memory:///f{i}.parquet"), 0))
+            .collect_vec();
+        let groups = round_robin_split(partitioned_files_to_file_groups(files), 3);
+
+        // Exactly `target_partitions`, or DataFusion adds its own RepartitionExec.
+        assert_eq!(groups.len(), 3);
+        assert_eq!(
+            groups.iter().map(FileGroup::len).collect_vec(),
+            vec![3, 2, 2]
+        );
+
+        // Every file lands in exactly one group: row ordinals need whole files.
+        let mut paths = groups
+            .iter()
+            .flat_map(|group| group.iter().map(|f| f.object_meta.location.to_string()))
+            .collect_vec();
+        paths.sort();
+        assert_eq!(paths.len(), 7);
+        paths.dedup();
+        assert_eq!(paths.len(), 7);
+    }
+
+    #[test]
+    fn test_round_robin_split_leaves_already_split_groups_alone() {
+        let files = (0..=MAX_PARTITION_DICT_CARDINALITY)
+            .map(|i| PartitionedFile::new(format!("memory:///f{i}.parquet"), 0))
+            .collect_vec();
+        let groups = partitioned_files_to_file_groups(files);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(round_robin_split(groups, 8).len(), 2);
+    }
 
     #[test]
     fn test_partitioned_files_to_file_groups_respects_dictionary_cardinality_limit() {

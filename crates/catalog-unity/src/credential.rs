@@ -119,6 +119,68 @@ impl TokenCredential for WorkspaceOAuthProvider {
     }
 }
 
+/// Databricks workload identity federation: exchanges an externally issued
+/// JWT (e.g. a Kubernetes projected service account token) for a workspace
+/// token with an RFC 8693 token-exchange grant.
+///
+/// <https://docs.databricks.com/aws/en/dev-tools/auth/oauth-federation-exchange>
+#[derive(Debug, Clone)]
+pub struct WorkspaceWorkloadIdentityOAuthProvider {
+    token_url: String,
+    client_id: String,
+    federated_token_file: String,
+}
+
+impl WorkspaceWorkloadIdentityOAuthProvider {
+    pub fn new(
+        client_id: impl Into<String>,
+        federated_token_file: impl Into<String>,
+        workspace_host: impl Into<String>,
+    ) -> Self {
+        Self {
+            token_url: format!("{}/oidc/v1/token", workspace_host.into()),
+            client_id: client_id.into(),
+            federated_token_file: federated_token_file.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenCredential for WorkspaceWorkloadIdentityOAuthProvider {
+    async fn fetch_token(
+        &self,
+        client: &ClientWithMiddleware,
+    ) -> Result<TemporaryToken<String>, UnityCatalogError> {
+        // Read on every fetch: the kubelet rotates projected tokens in place.
+        let subject_token = std::fs::read_to_string(&self.federated_token_file)
+            .map_err(|_| UnityCatalogError::FederatedTokenFile)?;
+
+        let response = client
+            .request(Method::POST, &self.token_url)
+            .header(ACCEPT, HeaderValue::from_static(CONTENT_TYPE_JSON))
+            .form(&[
+                (
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                ),
+                ("subject_token_type", "urn:ietf:params:oauth:token-type:jwt"),
+                ("subject_token", subject_token.trim()),
+                ("client_id", self.client_id.as_str()),
+                ("scope", DATABRICKS_WORKSPACE_SCOPE),
+            ])
+            .send()
+            .await
+            .map_err(UnityCatalogError::from)?;
+
+        let response: TokenResponse = non200_or_json(response).await?;
+
+        Ok(TemporaryToken {
+            token: response.access_token,
+            expiry: Some(Instant::now() + Duration::from_secs(response.expires_in)),
+        })
+    }
+}
+
 /// Encapsulates the logic to perform an OAuth token challenge
 #[derive(Debug, Clone)]
 pub struct ClientSecretOAuthProvider {
@@ -549,6 +611,46 @@ mod tests {
             token.unwrap_err().to_string(),
             "Non-200 returned on token acquisition: invalid_client: [abc123] Client authentication failed"
         );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_workload_identity() {
+        let server = MockServer::start_async().await;
+        let tokenfile = NamedTempFile::new().unwrap();
+        // Projected token files can end in a newline; it must not be sent.
+        std::fs::write(tokenfile.path(), "federated-jwt\n").unwrap();
+
+        let client = reqwest_middleware::ClientBuilder::new(Client::new()).build();
+
+        let mock = server
+            .mock_async(|when, then| {
+                when.path("/oidc/v1/token")
+                    .method("POST")
+                    .form_urlencoded_tuple(
+                        "grant_type",
+                        "urn:ietf:params:oauth:grant-type:token-exchange",
+                    )
+                    .form_urlencoded_tuple(
+                        "subject_token_type",
+                        "urn:ietf:params:oauth:token-type:jwt",
+                    )
+                    .form_urlencoded_tuple("subject_token", "federated-jwt")
+                    .form_urlencoded_tuple("client_id", "client_id")
+                    .form_urlencoded_tuple("scope", "all-apis");
+                then.body(r#"{"access_token": "TOKEN", "expires_in": 3600}"#);
+            })
+            .await;
+
+        let credential = WorkspaceWorkloadIdentityOAuthProvider::new(
+            "client_id",
+            tokenfile.path().to_str().unwrap(),
+            server.base_url(),
+        );
+
+        let token = credential.fetch_token(&client).await.unwrap();
+
+        assert_eq!(&token.token, "TOKEN");
+        mock.assert_async().await;
     }
 
     #[tokio::test]

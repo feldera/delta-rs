@@ -43,7 +43,7 @@ use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-pub use self::scan::DeltaScanExec;
+pub use self::scan::{DeltaScanExec, file_skipping_predicate};
 pub(crate) use self::scan::KernelScanPlan;
 use self::scan::ProjectedScanContract;
 pub(crate) use self::scan::RuntimeFileFilter;

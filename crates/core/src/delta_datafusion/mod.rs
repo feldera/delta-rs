@@ -66,6 +66,7 @@ pub use self::session::{
 };
 pub use self::table_provider::next::{
     DeletionVectorSelection, DeltaScan as DeltaScanNext, FileSelection, MissingSelectedFilePolicy,
+    file_skipping_predicate,
 };
 pub(crate) use self::utils::*;
 pub use cdf::scan::DeltaCdfTableProvider;

@@ -511,6 +511,26 @@ pub(crate) fn supports_filters_pushdown(
         .collect()
 }
 
+/// Returns the Delta Kernel predicate with which a scan of a table with
+/// `config` skips data files, given `filters`, or `None` if no filter can
+/// skip files.
+///
+/// `filters` must be in the form in which DataFusion pushes filters into a
+/// table provider: split into conjuncts, with types coerced and expressions
+/// simplified.  A conjunct that Delta Kernel cannot evaluate skips no files.
+/// A [`DeltaScan`](super::super::DeltaScan) skips files with the same
+/// predicate, so a caller that lists files with it, for example with
+/// [`DeltaTable::get_active_add_actions_by_predicate`](crate::DeltaTable::get_active_add_actions_by_predicate),
+/// lists the files that such a scan reads.
+pub fn file_skipping_predicate(
+    filters: &[Expr],
+    config: &TableConfiguration,
+) -> Option<PredicateRef> {
+    process_filters(filters, config, &DeltaScanConfig::default())
+        .ok()
+        .and_then(|(kernel, _parquet)| kernel)
+}
+
 /// Process a list of filter expressions and determine which
 /// predicates can be pushed down to the parquet scan and which
 /// can be handled at the kernel scan level.
@@ -830,6 +850,32 @@ mod tests {
         let expected = col("col-173b4db9-b5ad-427f-9e75-516aae37fbbb").eq(lit("BME"));
         assert_eq!(rewritten, expected);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_file_skipping_predicate() -> TestResult {
+        let mut table = open_fs_path("../test/tests/data/table_with_column_mapping");
+        table.load().await?;
+        let config = table.snapshot()?.snapshot().table_configuration();
+
+        // A conjunct that the kernel cannot evaluate skips no files, and the
+        // others still do, as in a scan.
+        let name = col(r#""Super Name""#);
+        let skippable = name.clone().eq(lit("Anthony Johnson"));
+        let unskippable = name.like(lit("A%"));
+        assert!(file_skipping_predicate(&[unskippable.clone()], config).is_none());
+        for filters in [
+            vec![skippable.clone()],
+            vec![skippable.clone(), unskippable.clone()],
+        ] {
+            let predicate = file_skipping_predicate(&filters, config);
+            assert!(predicate.is_some());
+            assert_eq!(
+                predicate,
+                process_filters(&filters, config, &DeltaScanConfig::default())?.0
+            );
+        }
         Ok(())
     }
 

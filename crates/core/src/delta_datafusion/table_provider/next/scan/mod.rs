@@ -75,6 +75,7 @@ use url::Url;
 
 use self::dv::load_deletion_vectors;
 pub use self::exec::DeltaScanExec;
+pub use self::plan::file_skipping_predicate;
 use self::exec::DvExecutionState;
 use self::exec_meta::DeltaScanMetaExec;
 use self::expr_adapter::{FieldIdAlignedExprAdapterFactory, relax_schema_nested_nullability};
